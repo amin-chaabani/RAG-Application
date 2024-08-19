@@ -1,18 +1,41 @@
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_experimental.text_splitter import SemanticChunker
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.chains.llm import LLMChain
 from langchain.chains.combine_documents.stuff import StuffDocumentsChain
 from langchain.chains import RetrievalQA
+from annoy import AnnoyIndex
 import gradio as gr
+from pymongo import MongoClient
+import boto3
+import redis
+import os
 
-# Définir LLM
+# Redis connection setup
+redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+# MongoDB setup
+client = MongoClient('mongodb://localhost:27017/')
+db = client['ragdb']
+users_collection = db['users']
+vector_store_collection = db['vector_stores']
+
+# MinIO setup
+s3_client = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9000',
+    aws_access_key_id='amine',
+    aws_secret_access_key='amine123',
+    region_name='us-east-1',
+    config=boto3.session.Config(signature_version='s3v4')
+)
+
+# Define LLM
 llm = Ollama(model="llama3")
 
-# Définir le prompt
+# Define the prompt template
 prompt = """
 1. Utilisez les éléments de contexte suivants pour répondre à la question à la fin.
 2. Si vous ne connaissez pas la réponse, dites simplement "Je ne sais pas" mais n'inventez pas de réponse.\n
@@ -45,64 +68,146 @@ combine_documents_chain = StuffDocumentsChain(
     callbacks=None
 )
 
-# Définir l'embedder et le vecteur
+# Define the embedder and Annoy index globally
 embedder = HuggingFaceEmbeddings()
-vector = None
+annoy_index = None
+all_documents = []
 
 
-def load_pdfs(files):
-    global vector
+# Define a User model
+def create_user(user_data):
+    user_id = users_collection.insert_one(user_data).inserted_id
+    return user_id
+
+
+# Define a Vector Store model
+def create_vector_store(user_id, s3_key):
+    vector_store_id = vector_store_collection.insert_one({
+        'user_id': user_id,
+        's3_path': s3_key
+    }).inserted_id
+    return vector_store_id
+
+
+# Function to process PDFs and build the Annoy index
+def process_pdfs(files):
+    global annoy_index, all_documents
+    user_id = create_user({"username": "default_user"})  # Replace with actual user logic
+
     if not files:
-        return "Aucun fichier PDF n'a été téléchargé."
+        return "No PDF files were uploaded."
 
     all_documents = []
     for file in files:
-        loader = PDFPlumberLoader(file.name)
-        docs = loader.load()
-        text_splitter = SemanticChunker(HuggingFaceEmbeddings())
-        documents = text_splitter.split_documents(docs)
-        all_documents.extend(documents)
+        # Load the PDF
+        pdf_loader = PDFPlumberLoader(file.name)
+        docs = pdf_loader.load()
 
-    vector = FAISS.from_documents(all_documents, embedder)
-    return "Les fichiers PDF ont été chargés et traités avec succès."
+        # Split the documents
+        text_splitter = SemanticChunker(embedder)
+        chunks = text_splitter.split_documents(docs)
+        all_documents.extend(chunks)
+
+    # Calculate vector dimension using a sample embedding
+    sample_vector = embedder.embed_query("sample text")
+    vector_dimension = len(sample_vector)
+
+    # Initialize Annoy index
+    annoy_index = AnnoyIndex(vector_dimension, 'angular')
+
+    # Add documents to the Annoy index
+    for i, doc in enumerate(all_documents):
+        vector = embedder.embed_query(doc.page_content)
+        annoy_index.add_item(i, vector)
+
+    # Build the index
+    annoy_index.build(10)
+
+    # Save the Annoy index to a file
+    index_filename = f"{user_id}_annoy_index.ann"
+
+    try:
+        annoy_index.save(index_filename)
+
+        # Upload the index file to MinIO
+        with open(index_filename, 'rb') as f:
+            s3_key = f"{user_id}/{index_filename}"
+            s3_client.put_object(Bucket='my-minio-bucke', Key=s3_key, Body=f)
+
+        # Store the S3 key in MongoDB
+        create_vector_store(user_id, s3_key)
+
+    finally:
+        # Ensure the local file is removed after upload
+        if os.path.exists(index_filename):
+            try:
+                os.remove(index_filename)
+            except PermissionError as e:
+                print(f"Failed to delete {index_filename}: {e}")
+
+    return f"PDF files have been successfully loaded and processed for user {user_id}."
 
 
+# Custom retriever based on Annoy index
+class AnnoyRetriever:
+    def __init__(self, index, documents):
+        self.index = index
+        self.documents = documents
+
+    def get_relevant_documents(self, query):
+        query_vector = embedder.embed_query(query)
+        nearest_neighbors = self.index.get_nns_by_vector(query_vector, 3)
+        return [self.documents[i] for i in nearest_neighbors]
+
+
+# Function to handle chat interaction
 def respond(message, history):
+    global annoy_index, all_documents
     if history is None:
         history = []
-    if vector is None:
-        return [("Veuillez d'abord charger les fichiers PDF.", "")], history
-    retriever = vector.as_retriever(search_type="similarity", search_kwargs={"k": 3})
-    qa = RetrievalQA(
-        combine_documents_chain=combine_documents_chain,
-        verbose=True,
-        retriever=retriever,
-        return_source_documents=True
-    )
-    response = qa(message)["result"]
+
+    print(f"Message reçu : {message}")
+
+    cached_response = redis_client.get(message)
+    if cached_response:
+        print(f"Réponse en cache trouvée pour '{message}': {cached_response}")
+        return [("Quick response (cache): " + cached_response, "")], history
+
+    print("Aucune réponse en cache trouvée, traitement de la requête...")
+
+    if annoy_index is None:
+        return [("Please upload PDF files first.", "")], history
+
+    retriever = AnnoyRetriever(annoy_index, all_documents)
+    retrieved_documents = retriever.get_relevant_documents(message)
+
+    context = "\n".join([doc.page_content for doc in retrieved_documents])
+
+    response = llm_chain.run({"context": context, "question": message})
     history.append((message, response))
+
+    # Stocker la réponse dans Redis
+    redis_client.setex(message, 3600, response)
+    print(f"Réponse stockée dans Redis pour '{message}': {response}")
+
     return history, history
 
 
-# Interface Gradio
+# Gradio interface for PDF upload
 file_interface = gr.Interface(
-    fn=load_pdfs,
-    inputs=gr.File(file_count="multiple", type="filepath"),  # Corrected type
+    fn=process_pdfs,
+    inputs=gr.File(file_count="multiple", type="filepath"),
     outputs="text",
     title="Charger des fichiers PDF"
 )
 
+# Gradio interface for chatbot interaction
 chat_interface = gr.Interface(
     fn=respond,
-    inputs=[gr.Textbox(placeholder="Posez une question liée aux plantes et à leurs maladies"), gr.State()],
+    inputs=[gr.Textbox(placeholder="Posez une question liée aux documents chargés"), gr.State()],
     outputs=[gr.Chatbot(), gr.State()],
-    title="RAG MBA chatBOT",
-    examples=["Quelles sont les différences entre LLAMA3:8B et LLAMA3:70B ?", "Qu'est-ce que llama ?"],
-    cache_examples=False  # Mise à jour pour désactiver le cache des exemples
+    title="RAG MBA Chatbot"
 )
 
-gr.TabbedInterface([file_interface, chat_interface], ["Charger des fichiers PDF", "Chatbot"]).launch(share=True,
-                                                                                                     server_name='0.0.0.0',
-                                                                                                     auth=[("demo",
-                                                                                                            "mba91")],
-                                                                                                     server_port=7773)
+# Combine both interfaces in a tabbed interface
+gr.TabbedInterface([file_interface, chat_interface], ["Charger des fichiers PDF", "Chatbot"]).launch(share=True)
